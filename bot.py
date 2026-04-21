@@ -6,6 +6,7 @@ import os
 import dotenv 
 dotenv.load_dotenv()
 import asyncio
+import time
 
 # Values from .end file
 TENANT_ID = os.environ['TENANT_ID']
@@ -29,6 +30,15 @@ STATUS_MSG_ID = int(os.environ['STATUS_MSG_ID'])
 SSH_KEY = os.environ['SSH_KEY']
 SSH_HOST = os.environ['SSH_HOST']
 
+_vm_cache = {
+    "value": None,
+    "timestamp": 0
+}
+
+_player_cache = {
+    "value": None,
+    "timestamp": 0
+}
 # Discord Bot Setup
 
 intents = discord.Intents.default()
@@ -66,6 +76,16 @@ def get_vm_status():
             return s["code"].replace("PowerState/", "")
     return "Unknown"
 
+async def get_vm_status_cached():
+    now = time.time()
+    if _vm_cache["value"] and now - _vm_cache["timestamp"] <60:
+        return _vm_cache["value"]
+    
+    status = await asyncio.to_thread(get_vm_status)
+    _vm_cache["value"] = status
+    _vm_cache["timestamp"] = now
+    return status
+
 def start_vm():
     azure_request("POST", "start")
 
@@ -96,27 +116,37 @@ async def check_minecraft_service():
 
 
 # Minecraft Helper
-def get_player_count():
+async def get_player_count():
     try:
         from mcstatus import JavaServer
         server = JavaServer(SERVER_IP, int(SERVER_PORT))
-        return server.status().players.online
-    except Exception :
+        status = await server.async_status()
+        return status.players.online
+    except Exception as e:
+        print(f"Error occurred while fetching player count: {e}")
         return None
+
+async def get_player_count_cached(ttl=30):
+    now = time.time()
+    if _player_cache["value"] is not None and now - _player_cache["timestamp"] < ttl:
+        return _player_cache["value"]
     
+    count = await get_player_count()
+    _player_cache["value"] = count
+    _player_cache["timestamp"] = now
+    return count
 # Auto Shutdown after X minutes of inactivity
 @tasks.loop(minutes=SHUTDOWN_CHECK_INTERVAL)
 async def auto_shutdown():
-    vm_status = get_vm_status()
+    vm_status = await get_vm_status_cached()
     if vm_status != "running":
         return
     
-    player_count = get_player_count()
+    player_count = await get_player_count_cached()
     if player_count is None:
         print("Failed to get player count. Skipping auto shutdown check.")
         return
     
-    print(f"Auto shutdown check: {player_count} player(s) online.")
     
     if player_count == 0:
         channel = bot.get_channel(MESSAGE_CHANNEL)
@@ -136,7 +166,7 @@ async def auto_shutdown():
 
 @tasks.loop(minutes=STATUS_CHECK_INTERVAL)
 async def status_update():
-    vm_status = get_vm_status()
+    vm_status = await get_vm_status_cached()
     embed = discord.Embed(title="Minecraft Server Status", color=0x00ff00 if vm_status == "running" else 0xff0000)
     emoji = {
         "running": "✅",
@@ -146,9 +176,7 @@ async def status_update():
         "Unknown": "❓"
     }
     if vm_status == "running":
-        players = get_player_count()
-        player_info = f"\nConnect to: `{SERVER_IP}:{SERVER_PORT}` with **{players}** player(s) online" if players is not None else ""
-        content = f"{emoji[vm_status]} Server is **{vm_status}**!{player_info}"
+        content = f"{emoji[vm_status]} Server is **{vm_status}**!"
     else:
         content = f"{emoji[vm_status]} Server is **{vm_status}**."
     embed.description = content
@@ -158,6 +186,8 @@ async def status_update():
         try:
             msg = await channel.fetch_message(STATUS_MSG_ID)
             await msg.edit(embed=embed,content="")
+        except discord.NotFound:
+            print(f"Status message {STATUS_MSG_ID} was deleted. Please update your .env with a new message ID.")
         except Exception as e:
             print(f"Failed to update status message: {e}")
 
@@ -171,9 +201,14 @@ tree.add_command(server_group)
 
 @server_group.command(name="status", description="Check Minecraft server status")
 async def status(interaction: discord.Interaction):
-    await interaction.response.defer()
+    print(f"Received status command from {interaction.user} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if not interaction.response.is_done():
+        try:
+            await interaction.response.defer()
+        except discord.HTTPException:
+            return
 
-    vm_status = get_vm_status()
+    vm_status =  await get_vm_status_cached()
     emoji = {
         "running": "✅",
         "starting": "⏳",
@@ -181,27 +216,29 @@ async def status(interaction: discord.Interaction):
         "deallocated": "🛑",
         "Unknown": "❓"
     }
+    print(f"Checked server status at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {vm_status}")
     if vm_status == "running":
-        players = get_player_count()
+        players = await get_player_count_cached()
+        print(f"Player count: {players}")
         if players is None:
             player_info = " but Minecraft server is not responding"
         else:
             player_info = f"\nConnect to: `{SERVER_IP}:{SERVER_PORT}` with **{players}** player(s) online" if players is not None else ""
         
-        await interaction.followup.send(f"{emoji[vm_status]} Server is **{vm_status}**!{player_info}")
+        await interaction.followup.send(f"{emoji.get(vm_status, '❓')} Server is **{vm_status}**!{player_info}")
     else:
-        await interaction.followup.send(f"{emoji[vm_status]} Server is **{vm_status}**.")
+        await interaction.followup.send(f"{emoji.get(vm_status, '❓')} Server is **{vm_status}**.")
 
 @server_group.command(name="start", description="Start the Minecraft server")
 async def start(interaction: discord.Interaction):
     await interaction.response.defer()
 
-    vm_status = get_vm_status()
+    vm_status = await get_vm_status_cached()
     if vm_status in ["starting", "deallocating"]:
         await interaction.followup.send(f"⏳ Server is currently **{vm_status}**. Please wait...")
         return
     
-    if vm_status == "running" and get_player_count() is None: 
+    if vm_status == "running" and await get_player_count_cached() is None: 
         await interaction.followup.send(f"Server is already running but minecraft server is not responding.")
         return
     await interaction.followup.send("Starting the server")
@@ -212,7 +249,7 @@ async def start(interaction: discord.Interaction):
 
     for _ in range(30):
         await asyncio.sleep(5)
-        if get_player_count() is not None:
+        if await get_player_count_cached() is not None:
             print(f"Server has started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             await interaction.channel.send(f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
             return
@@ -225,7 +262,7 @@ async def on_ready():
 
     status_update.start()
 
-    if get_vm_status() == "running" and not auto_shutdown.is_running():
+    if await get_vm_status_cached() == "running" and not auto_shutdown.is_running():
         auto_shutdown.start()
 
     print("------")
