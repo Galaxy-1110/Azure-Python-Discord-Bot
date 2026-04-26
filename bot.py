@@ -135,6 +135,7 @@ async def get_player_count_cached(ttl=30):
     _player_cache["value"] = count
     _player_cache["timestamp"] = now
     return count
+
 # Auto Shutdown after X minutes of inactivity
 @tasks.loop(minutes=SHUTDOWN_CHECK_INTERVAL)
 async def auto_shutdown():
@@ -238,10 +239,13 @@ async def start(interaction: discord.Interaction):
         await interaction.followup.send(f"⏳ Server is currently **{vm_status}**. Please wait...")
         return
     
-    if vm_status == "running" and await get_player_count_cached() is None: 
-        await interaction.followup.send(f"Server is already running but minecraft server is not responding.")
-        return
-    await interaction.followup.send("Starting the server")
+    if vm_status == "running":
+        if await get_player_count_cached() is None:
+            return await interaction.followup.send(f"Server is already running but minecraft server is not responding.")
+        else:
+           return await interaction.followup.send("Server is already running")
+    
+    msg = await interaction.followup.send("Starting the server")
     start_vm()
 
     if not auto_shutdown.is_running():
@@ -251,7 +255,7 @@ async def start(interaction: discord.Interaction):
         await asyncio.sleep(5)
         if await get_player_count_cached() is not None:
             print(f"Server has started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            await interaction.channel.send(f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
+            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
             return
     await interaction.channel.send(f"❌ Server failed to start within expected time. Please check Azure portal.")
 
