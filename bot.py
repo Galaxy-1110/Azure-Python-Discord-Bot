@@ -1,12 +1,13 @@
 from datetime import datetime
 import discord
 import requests
-from discord.ext import commands,tasks
+from discord.ext import tasks
 import os
 import dotenv 
 dotenv.load_dotenv()
 import asyncio
 import time
+from mcstatus import JavaServer
 
 # Values from .end file
 TENANT_ID = os.environ['TENANT_ID']
@@ -17,6 +18,7 @@ RESOURCE_GROUP = os.environ['RESOURCE_GROUP']
 VM_NAME = os.environ['VM_NAME']
 
 SERVER_IP = os.environ['MC_SERVER_IP']
+SERVER_PORT = os.environ['MC_SERVER_PORT']
 
 DISCORD_BOT_TOKEN = os.environ['BOT_TOKEN']
 
@@ -28,6 +30,7 @@ STATUS_VM_ID = int(os.environ['STATUS_VM_ID'])
 SSH_KEY = os.environ['SSH_KEY']
 SSH_HOST = os.environ['SSH_HOST']
 
+# Cache Setup
 _vm_cache = {
     "value": None,
     "timestamp": 0
@@ -37,6 +40,12 @@ _player_cache = {
     "value": None,
     "timestamp": 0
 }
+def clear_caches():
+    _vm_cache["value"] = None
+    _vm_cache["timestamp"] = 0
+    _player_cache["value"] = None
+    _player_cache["timestamp"] = 0
+
 # Discord Bot Setup
 
 intents = discord.Intents.default()
@@ -80,24 +89,28 @@ async def get_vm_status_cached():
         return _vm_cache["value"]
     
     status = await asyncio.to_thread(get_vm_status)
-    _vm_cache["value"] = status
-    _vm_cache["timestamp"] = now
+
+    if status != "Unknown":
+        _vm_cache["value"] = status
+        _vm_cache["timestamp"] = now
     return status
 
 def start_vm():
     azure_request("POST", "start")
+    clear_caches()
 
 def deallocate_vm():
     azure_request("POST", "deallocate")
+    clear_caches()
 
 def restart_vm():
     azure_request("POST", "restart")
+    clear_caches()
     
 async def azure_command(cmd: str):
     try:
         process = await asyncio.create_subprocess_exec("ssh",
             "-i", SSH_KEY,
-            "-o", "StrictHostKeyChecking=no",
             SSH_HOST,
             cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -109,18 +122,20 @@ async def azure_command(cmd: str):
     except asyncio.TimeoutError:
         return "timeout"
 
+STOP_COMMAND = "sudo systemctl stop minecraft"
+STATUS_COMMAND = "systemctl is-active minecraft"
+
 async def stop_mc_server():
-    await azure_command("sudo systemctl stop minecraft")
+    await azure_command(STOP_COMMAND)
 
 async def check_minecraft_service():
-    return await azure_command("systemctl is-active minecraft")
+    return await azure_command(STATUS_COMMAND)
 
 
 # Minecraft Helper
 async def get_player_count():
     try:
-        from mcstatus import JavaServer
-        server = JavaServer.lookup(SERVER_IP)
+        server = JavaServer.lookup(f"[{SERVER_IP}]:{SERVER_PORT}")
         status = await server.async_status()
         return status.players.online
     except Exception as e:
@@ -133,8 +148,10 @@ async def get_player_count_cached(ttl=30):
         return _player_cache["value"]
     
     count = await get_player_count()
-    _player_cache["value"] = count
-    _player_cache["timestamp"] = now
+
+    if count is not None:
+        _player_cache["value"] = count
+        _player_cache["timestamp"] = now
     return count
 
 # Auto Shutdown after X minutes of inactivity
@@ -162,7 +179,7 @@ async def auto_shutdown():
             status=await check_minecraft_service()
             if status != "active":
                 break
-        deallocate_vm()
+        await asyncio.to_thread(deallocate_vm)
     else:
         print(f"{player_count} player(s) online. Server will remain running.")
 
@@ -210,14 +227,13 @@ async def status(interaction: discord.Interaction):
         "deallocated": "🛑",
         "Unknown": "❓"
     }
-    print(f"Checked server status at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {vm_status}")
     if vm_status == "running":
-        players = await get_player_count_cached()
-        print(f"Player count: {players}")
+        players = await get_player_count()
+        print(players)
         if players is None:
             player_info = " but Minecraft server is not responding"
         else:
-            player_info = f"\nConnect to: `{SERVER_IP}` with **{players}** player(s) online" if players is not None else ""
+            player_info = f"\nConnect to: `{SERVER_IP}:{SERVER_PORT}` with **{players}** player(s) online" 
         
         await interaction.followup.send(f"{emoji.get(vm_status, '❓')} Server is **{vm_status}**!{player_info}")
     else:
@@ -246,9 +262,9 @@ async def start(interaction: discord.Interaction):
 
     for _ in range(30):
         await asyncio.sleep(5)
-        if await get_player_count_cached() is not None:
+        if await get_player_count() is not None:
             print(f"Server has started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}`")
+            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
             return
     await interaction.channel.send(f"❌ Server failed to start within expected time. Please check Azure portal.")
 
@@ -269,9 +285,9 @@ async def restart(interaction: discord.Interaction):
 
     for _ in range(30):
         await asyncio.sleep(5)
-        if await get_player_count_cached() is not None:
+        if await get_player_count() is not None:
             print(f"Server has restarted at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}`")
+            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
             return
     await interaction.channel.send(f"❌ Server failed to restart within expected time. Please check Azure portal.")
 
