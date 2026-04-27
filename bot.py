@@ -17,15 +17,13 @@ RESOURCE_GROUP = os.environ['RESOURCE_GROUP']
 VM_NAME = os.environ['VM_NAME']
 
 SERVER_IP = os.environ['MC_SERVER_IP']
-SERVER_PORT = os.environ['MC_SERVER_PORT']
 
 DISCORD_BOT_TOKEN = os.environ['BOT_TOKEN']
 
 SHUTDOWN_CHECK_INTERVAL = int(os.environ['SHUTDOWN_CHECK_INTERVAL'])
 MESSAGE_CHANNEL = int(os.environ['MESSAGE_CHANNEL'])
 STATUS_CHECK_INTERVAL = int(os.environ['STATUS_CHECK_INTERVAL'])
-STATUS_CHANNEL = int(os.environ['STATUS_CHANNEL'])
-STATUS_MSG_ID = int(os.environ['STATUS_MSG_ID'])
+STATUS_VM_ID = int(os.environ['STATUS_VM_ID'])
 
 SSH_KEY = os.environ['SSH_KEY']
 SSH_HOST = os.environ['SSH_HOST']
@@ -92,6 +90,9 @@ def start_vm():
 def deallocate_vm():
     azure_request("POST", "deallocate")
 
+def restart_vm():
+    azure_request("POST", "restart")
+    
 async def azure_command(cmd: str):
     try:
         process = await asyncio.create_subprocess_exec("ssh",
@@ -119,11 +120,11 @@ async def check_minecraft_service():
 async def get_player_count():
     try:
         from mcstatus import JavaServer
-        server = JavaServer(SERVER_IP, int(SERVER_PORT))
+        server = JavaServer.lookup(SERVER_IP)
         status = await server.async_status()
         return status.players.online
     except Exception as e:
-        print(f"Error occurred while fetching player count: {e}")
+        print(f"Error occurred while fetching player count: {type(e).__name__}: {e}")
         return None
 
 async def get_player_count_cached(ttl=30):
@@ -168,7 +169,6 @@ async def auto_shutdown():
 @tasks.loop(minutes=STATUS_CHECK_INTERVAL)
 async def status_update():
     vm_status = await get_vm_status_cached()
-    embed = discord.Embed(title="Minecraft Server Status", color=0x00ff00 if vm_status == "running" else 0xff0000)
     emoji = {
         "running": "✅",
         "starting": "⏳",
@@ -177,20 +177,13 @@ async def status_update():
         "Unknown": "❓"
     }
     if vm_status == "running":
-        content = f"{emoji[vm_status]} Server is **{vm_status}**!"
+        players = await get_player_count_cached()
+        content = f"ON! {players} playing" if players is not None else "ON but Minecraft server is not responding"
     else:
-        content = f"{emoji[vm_status]} Server is **{vm_status}**."
-    embed.description = content
-    embed.set_footer(text=f"Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    channel = bot.get_channel(STATUS_CHANNEL)
+        content = f"{emoji.get(vm_status, '❓')} {vm_status.upper()}"
+    channel = bot.get_channel(STATUS_VM_ID)
     if channel:
-        try:
-            msg = await channel.fetch_message(STATUS_MSG_ID)
-            await msg.edit(embed=embed,content="")
-        except discord.NotFound:
-            print(f"Status message {STATUS_MSG_ID} was deleted. Please update your .env with a new message ID.")
-        except Exception as e:
-            print(f"Failed to update status message: {e}")
+        await channel.edit(name=f"{content}")
 
 # Slash Commands
 @tree.command(name="ping", description="Check bot responsiveness")
@@ -224,7 +217,7 @@ async def status(interaction: discord.Interaction):
         if players is None:
             player_info = " but Minecraft server is not responding"
         else:
-            player_info = f"\nConnect to: `{SERVER_IP}:{SERVER_PORT}` with **{players}** player(s) online" if players is not None else ""
+            player_info = f"\nConnect to: `{SERVER_IP}` with **{players}** player(s) online" if players is not None else ""
         
         await interaction.followup.send(f"{emoji.get(vm_status, '❓')} Server is **{vm_status}**!{player_info}")
     else:
@@ -255,9 +248,32 @@ async def start(interaction: discord.Interaction):
         await asyncio.sleep(5)
         if await get_player_count_cached() is not None:
             print(f"Server has started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}:{SERVER_PORT}`")
+            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}`")
             return
     await interaction.channel.send(f"❌ Server failed to start within expected time. Please check Azure portal.")
+
+@server_group.command(name="restart", description="Restart the Minecraft server")
+async def restart(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    vm_status = await get_vm_status_cached()
+    if vm_status not in ["running"]:
+        await interaction.followup.send(f"❌ Server is **{vm_status}**. Please start the server first.")
+        return
+
+    msg = await interaction.followup.send("Restarting the server")
+    restart_vm()
+
+    if not auto_shutdown.is_running():
+        auto_shutdown.start()
+
+    for _ in range(30):
+        await asyncio.sleep(5)
+        if await get_player_count_cached() is not None:
+            print(f"Server has restarted at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            await msg.edit(content=f"{interaction.user.mention} ✅ Server is **running**!\nConnect to: `{SERVER_IP}`")
+            return
+    await interaction.channel.send(f"❌ Server failed to restart within expected time. Please check Azure portal.")
 
 @bot.event
 async def on_ready():
